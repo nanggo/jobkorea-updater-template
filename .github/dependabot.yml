@@ -1,0 +1,25 @@
+version: 2
+
+updates:
+  # Dependabot uses the npm ecosystem for pnpm projects.
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Asia/Seoul"
+    groups:
+      # Keep the browser runtime and test runner on matching versions.
+      playwright:
+        patterns:
+          - "playwright"
+          - "@playwright/test"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Asia/Seoul"

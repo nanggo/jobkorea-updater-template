@@ -1,0 +1,28 @@
+{
+  "name": "jobkorea-updater-template",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Reusable Playwright template for refreshing a JobKorea resume with Telegram notifications",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\" && tsc",
+    "prestart": "pnpm build",
+    "start": "node dist/index.js",
+    "lint": "tsc --noEmit",
+    "test": "pnpm build && node --test test/*.test.js",
+    "test:browser": "pnpm build && node test/browser-launch.smoke.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "packageManager": "pnpm@10.30.3",
+  "dependencies": {
+    "@playwright/test": "^1.63.0",
+    "playwright": "^1.63.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.1",
+    "dotenv": "^17.4.2",
+    "typescript": "^7.0.2"
+  }
+}

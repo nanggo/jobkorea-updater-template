@@ -1,0 +1,432 @@
+# Installation: see examples/workflows/README.md before copying into .github/workflows/.
+name: Update Resume
+# Scheduled runs append their cron so the watchdog can tell slots apart however late they start.
+run-name: Update Resume (attempt ${{ github.event.inputs.attempt || '1' }}, chain ${{ github.event.inputs.chain_id || github.run_id }}${{ github.event.schedule && format(', schedule {0}', github.event.schedule) || '' }})
+
+on:
+  schedule:
+    - cron: "50 23 * * *" # KST 기준 오전 8:50 (UTC 23:50)
+    - cron: "50 3 * * *" # KST 기준 오후 12:50 (UTC 3:50)
+  workflow_dispatch:
+    inputs:
+      chain_id:
+        description: "Original workflow run ID (automatic retries only; leave empty for a new run)"
+        required: false
+        default: ""
+        type: string
+      attempt:
+        description: "Retry attempt number"
+        required: false
+        default: "1"
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "3"
+          - "4"
+
+concurrency:
+  group: update-resume
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Use a runner whose network can reach JobKorea; install this example in a private repo.
+  # Only the update job receives application secrets. Dispatch tokens stay on hosted runners.
+  probe-job:
+    if: vars.ENABLE_AUTOMATION == 'true'
+    name: update-resume-probe-${{ github.event.inputs.attempt || '1' }}
+    runs-on: [self-hosted, jobkorea]
+    timeout-minutes: 5
+    outputs:
+      probe_outcome: ${{ steps.jobkorea-probe.outcome }}
+    permissions:
+      contents: read
+
+    steps:
+      - name: Probe JobKorea login endpoint
+        id: jobkorea-probe
+        continue-on-error: true
+        run: |
+          curl --silent --show-error --location --fail-with-body \
+            --connect-timeout 10 \
+            --max-time 30 \
+            --retry 2 \
+            --retry-delay 5 \
+            --retry-all-errors \
+            --output /dev/null \
+            --write-out "http_code=%{http_code}\ntime_namelookup=%{time_namelookup}\ntime_connect=%{time_connect}\ntime_appconnect=%{time_appconnect}\ntime_starttransfer=%{time_starttransfer}\ntime_total=%{time_total}\nurl_effective=%{url_effective}\n" \
+            https://www.jobkorea.co.kr/Login/
+
+  # Notification, retry delay and dispatch stay on a GitHub-hosted runner so the
+  # actions: write token never reaches the self-hosted machine.
+  probe-failure:
+    name: probe-failure-${{ github.event.inputs.attempt || '1' }}
+    needs: probe-job
+    if: needs['probe-job'].outputs.probe_outcome == 'failure'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      actions: write
+      contents: read
+
+    steps:
+      - name: Notify JobKorea probe failure
+        id: notify-probe-failure
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.event.inputs.attempt || '1' }}
+          CHAIN_ID: ${{ github.event.inputs.chain_id || github.run_id }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RETRY_REF: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          MAX_ATTEMPTS=4
+          MAX_RERUNS=3
+          case "${RUN_ATTEMPT}" in
+            1|2|3|4)
+              ;;
+            *)
+              RUN_ATTEMPT=1
+              ;;
+          esac
+
+          if [ "${RUN_ATTEMPT}" -lt "${MAX_ATTEMPTS}" ]; then
+            NEXT_ATTEMPT=$((RUN_ATTEMPT + 1))
+            case "${RUN_ATTEMPT}" in
+              1)
+                RETRY_DELAY_MINUTES=3
+                ;;
+              2)
+                RETRY_DELAY_MINUTES=8
+                ;;
+              3)
+                RETRY_DELAY_MINUTES=15
+                ;;
+              *)
+                RETRY_DELAY_MINUTES=0
+                ;;
+            esac
+            MESSAGE="$(cat <<EOF
+          ⚠️ 이력서 업데이트 일시 실패
+          이유: 자체 runner에서 JobKorea 로그인 페이지의 정상 응답을 받지 못했습니다.
+          조치: 약 ${RETRY_DELAY_MINUTES}분 후 ${NEXT_ATTEMPT}/${MAX_ATTEMPTS}번째 시도로 자동 재시도 예정입니다. (최대 ${MAX_RERUNS}회)
+          대상: https://www.jobkorea.co.kr/Login/
+          확인: ${RUN_URL}
+          시간: $(TZ=Asia/Seoul date '+%Y-%m-%d %H:%M:%S KST')
+          EOF
+          )"
+            curl --silent --show-error --fail \
+              --connect-timeout 5 \
+              --max-time 15 \
+              --output /dev/null \
+              --request POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=${MESSAGE}" || echo "Telegram probe failure notification failed"
+
+            RETRY_REF="${RETRY_REF:-main}"
+            delay_seconds=$((RETRY_DELAY_MINUTES * 60))
+            echo "Waiting ${delay_seconds}s before dispatching retry attempt ${NEXT_ATTEMPT}/${MAX_ATTEMPTS}."
+            sleep "${delay_seconds}"
+
+            dispatch_retry() {
+              local existing_retry dispatch_attempt dispatch_delay chain_created_at
+
+              if [[ ! "${CHAIN_ID}" =~ ^[0-9]+$ ]] || [[ ! "${NEXT_ATTEMPT}" =~ ^[2-4]$ ]]; then
+                echo "Invalid retry chain or attempt; refusing dispatch."
+                return 1
+              fi
+              if ! chain_created_at="$(timeout 30s gh run view "${CHAIN_ID}" --repo "${GH_REPO}" --json createdAt --jq .createdAt)"; then
+                echo "Unable to read the retry chain start; refusing dispatch."
+                return 1
+              fi
+              if [[ ! "${chain_created_at}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
+                echo "Invalid retry chain start; refusing dispatch."
+                return 1
+              fi
+
+              retry_already_exists() {
+                if ! existing_retry="$(
+                  timeout 30s gh api --paginate --slurp --method GET \
+                    "repos/${GH_REPO}/actions/workflows/update_resume.yml/runs" \
+                    -f "branch=${RETRY_REF}" \
+                    -f event=workflow_dispatch \
+                    -f "created=>=${chain_created_at}" \
+                    -f per_page=100 \
+                    | jq --arg title "Update Resume (attempt ${NEXT_ATTEMPT}, chain ${CHAIN_ID})" \
+                      'any(.[].workflow_runs[]; .display_title == $title)'
+                )"; then
+                  echo "Unable to verify whether retry attempt ${NEXT_ATTEMPT} already exists. Refusing a duplicate dispatch."
+                  return 2
+                fi
+                [ "${existing_retry}" = "true" ]
+              }
+
+              if retry_already_exists; then
+                echo "Retry attempt ${NEXT_ATTEMPT} already exists (including completed runs)."
+                return 0
+              elif [ "$?" -eq 2 ]; then
+                return 1
+              fi
+
+              for dispatch_attempt in 1 2 3; do
+                if timeout 30s gh workflow run update_resume.yml \
+                  --repo "${GH_REPO}" \
+                  --ref "${RETRY_REF}" \
+                  -f "attempt=${NEXT_ATTEMPT}" \
+                  -f "chain_id=${CHAIN_ID}"; then
+                  return 0
+                fi
+
+                dispatch_delay=$((dispatch_attempt * 5))
+                echo "Retry dispatch returned an error (${dispatch_attempt}/3). Checking for an accepted run in ${dispatch_delay}s."
+                sleep "${dispatch_delay}"
+
+                if retry_already_exists; then
+                  echo "Retry attempt ${NEXT_ATTEMPT} was accepted despite the dispatch error."
+                  return 0
+                elif [ "$?" -eq 2 ]; then
+                  return 1
+                fi
+              done
+              return 1
+            }
+
+            dispatch_retry
+            echo "retry-dispatched=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          else
+            MESSAGE="$(cat <<EOF
+          ❌ 이력서 업데이트 최종 실패!
+          이유: 자체 runner에서 JobKorea 로그인 페이지의 정상 응답을 받지 못했습니다.
+          재시도: 자동 재시도 후에도 연결 실패
+          대상: https://www.jobkorea.co.kr/Login/
+          확인: ${RUN_URL}
+          시간: $(TZ=Asia/Seoul date '+%Y-%m-%d %H:%M:%S KST')
+          EOF
+          )"
+          fi
+
+          curl --silent --show-error --fail \
+            --connect-timeout 5 \
+            --max-time 15 \
+            --output /dev/null \
+            --request POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${MESSAGE}" || echo "Telegram probe failure notification failed"
+
+          echo "terminal-failure=true" >> "${GITHUB_OUTPUT}"
+
+      - name: Mark incomplete probe run as failed
+        if: steps.notify-probe-failure.outputs.retry-dispatched == 'true'
+        run: |
+          echo "::error::JobKorea probe failed. Retry was dispatched in a separate workflow run."
+          exit 1
+
+      - name: Mark terminal probe failure
+        if: steps.notify-probe-failure.outputs.terminal-failure == 'true'
+        run: |
+          echo "::error::JobKorea probe failed after all retry attempts."
+          exit 1
+
+  update-resume:
+    needs: probe-job
+    if: needs['probe-job'].outputs.probe_outcome == 'success'
+    # Provision Chromium's OS dependencies and sandbox support on your runner first.
+    # Runtime jobs do not require sudo.
+    runs-on: [self-hosted, jobkorea]
+    timeout-minutes: 25
+    outputs:
+      update_exit_code: ${{ steps.update_script.outputs.exit_code }}
+      update_step_outcome: ${{ steps.update_script.outcome }}
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # Set up Node before pnpm. Persistent runners keep their own package store;
+      # do not share an Actions cache with untrusted PR jobs.
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10.30.3
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # The runner keeps its browser cache between runs; this is a no-op unless the
+      # locked Playwright version needs a different Chromium build.
+      - name: Install Playwright Chromium
+        run: pnpm exec playwright install chromium
+
+      - name: Build project
+        run: pnpm build
+
+      - name: Run update script
+        id: update_script
+        env:
+          JOBKOREA_ID: ${{ secrets.JOBKOREA_ID }}
+          JOBKOREA_PWD: ${{ secrets.JOBKOREA_PWD }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          NAVIGATION_TIMEOUT_MS: "30000"
+          WORKFLOW_ATTEMPT: ${{ github.event.inputs.attempt || '1' }}
+        run: |
+          set +e
+          node dist/index.js
+          exit_code=$?
+          set -e
+          echo "exit_code=${exit_code}" >> "${GITHUB_OUTPUT}"
+          exit "${exit_code}"
+
+  retry-update-failure:
+    name: retry-update-resume-${{ github.event.inputs.attempt || '1' }}
+    needs:
+      - probe-job
+      - update-resume
+    if: >
+      always() &&
+      needs['probe-job'].result == 'success' &&
+      needs['update-resume'].result == 'failure' &&
+      needs['update-resume'].outputs.update_step_outcome == 'failure' &&
+      needs['update-resume'].outputs.update_exit_code == '75'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      actions: write
+      contents: read
+
+    steps:
+      - name: Dispatch retry after update failure
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RETRY_REF: ${{ github.ref_name }}
+          RUN_ATTEMPT: ${{ github.event.inputs.attempt || '1' }}
+          CHAIN_ID: ${{ github.event.inputs.chain_id || github.run_id }}
+        run: |
+          set -euo pipefail
+
+          MAX_ATTEMPTS=4
+          case "${RUN_ATTEMPT}" in
+            1|2|3|4)
+              ;;
+            *)
+              RUN_ATTEMPT=1
+              ;;
+          esac
+
+          if [ "${RUN_ATTEMPT}" -ge "${MAX_ATTEMPTS}" ]; then
+            echo "Update job failed on terminal retry attempt ${RUN_ATTEMPT}/${MAX_ATTEMPTS}."
+            exit 0
+          fi
+
+          NEXT_ATTEMPT=$((RUN_ATTEMPT + 1))
+          case "${RUN_ATTEMPT}" in
+            1)
+              RETRY_DELAY_MINUTES=3
+              ;;
+            2)
+              RETRY_DELAY_MINUTES=8
+              ;;
+            3)
+              RETRY_DELAY_MINUTES=15
+              ;;
+          esac
+
+          RETRY_REF="${RETRY_REF:-main}"
+          delay_seconds=$((RETRY_DELAY_MINUTES * 60))
+          echo "Waiting ${delay_seconds}s before dispatching retry attempt ${NEXT_ATTEMPT}/${MAX_ATTEMPTS} after update failure."
+          sleep "${delay_seconds}"
+
+          dispatch_retry() {
+            local existing_retry dispatch_attempt dispatch_delay chain_created_at
+
+            if [[ ! "${CHAIN_ID}" =~ ^[0-9]+$ ]] || [[ ! "${NEXT_ATTEMPT}" =~ ^[2-4]$ ]]; then
+              echo "Invalid retry chain or attempt; refusing dispatch."
+              return 1
+            fi
+            if ! chain_created_at="$(timeout 30s gh run view "${CHAIN_ID}" --repo "${GH_REPO}" --json createdAt --jq .createdAt)"; then
+              echo "Unable to read the retry chain start; refusing dispatch."
+              return 1
+            fi
+            if [[ ! "${chain_created_at}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
+              echo "Invalid retry chain start; refusing dispatch."
+              return 1
+            fi
+
+            retry_already_exists() {
+              if ! existing_retry="$(
+                timeout 30s gh api --paginate --slurp --method GET \
+                  "repos/${GH_REPO}/actions/workflows/update_resume.yml/runs" \
+                  -f "branch=${RETRY_REF}" \
+                  -f event=workflow_dispatch \
+                  -f "created=>=${chain_created_at}" \
+                  -f per_page=100 \
+                  | jq --arg title "Update Resume (attempt ${NEXT_ATTEMPT}, chain ${CHAIN_ID})" \
+                    'any(.[].workflow_runs[]; .display_title == $title)'
+              )"; then
+                echo "Unable to verify whether retry attempt ${NEXT_ATTEMPT} already exists. Refusing a duplicate dispatch."
+                return 2
+              fi
+              [ "${existing_retry}" = "true" ]
+            }
+
+            if retry_already_exists; then
+              echo "Retry attempt ${NEXT_ATTEMPT} already exists (including completed runs)."
+              return 0
+            elif [ "$?" -eq 2 ]; then
+              return 1
+            fi
+
+            for dispatch_attempt in 1 2 3; do
+              if timeout 30s gh workflow run update_resume.yml \
+                --repo "${GH_REPO}" \
+                --ref "${RETRY_REF}" \
+                -f "attempt=${NEXT_ATTEMPT}" \
+                -f "chain_id=${CHAIN_ID}"; then
+                return 0
+              fi
+
+              dispatch_delay=$((dispatch_attempt * 5))
+              echo "Retry dispatch returned an error (${dispatch_attempt}/3). Checking for an accepted run in ${dispatch_delay}s."
+              sleep "${dispatch_delay}"
+
+              if retry_already_exists; then
+                echo "Retry attempt ${NEXT_ATTEMPT} was accepted despite the dispatch error."
+                return 0
+              elif [ "$?" -eq 2 ]; then
+                return 1
+              fi
+            done
+            return 1
+          }
+
+          dispatch_retry
+
+  # This action refreshes only this workflow, so every scheduled example needs it.
+  workflow-keepalive:
+    if: github.event_name == 'schedule' && vars.ENABLE_AUTOMATION == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - uses: liskin/gh-workflow-keepalive@f72ff1a1336129f29bf0166c0fd0ca6cf1bcb38c # v1
+        continue-on-error: true

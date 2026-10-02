@@ -1,0 +1,137 @@
+# Installation: see examples/workflows/README.md before copying into .github/workflows/.
+name: Update Resume Watchdog
+
+on:
+  schedule:
+    # Check each slot 8 hours after its cron time to allow for scheduler delays.
+    # Keep these times aligned with update_resume.yml if you change the schedule.
+    - cron: "50 7 * * *" # KST 오전 8:50 슬롯 확인 (KST 16:50)
+    - cron: "50 11 * * *" # KST 오후 12:50 슬롯 확인 (KST 20:50)
+  workflow_dispatch:
+    inputs:
+      slot:
+        description: "Scheduled update slot to check"
+        required: true
+        default: morning
+        type: choice
+        options:
+          - morning
+          - afternoon
+
+permissions:
+  actions: read
+
+jobs:
+  check-slot:
+    if: vars.ENABLE_AUTOMATION == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Check scheduled update outcome
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TRIGGER_SCHEDULE: ${{ github.event.schedule }}
+          INPUT_SLOT: ${{ inputs.slot }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUNS_URL: ${{ github.server_url }}/${{ github.repository }}/actions/workflows/update_resume.yml
+        run: |
+          set -euo pipefail
+
+          case "${TRIGGER_SCHEDULE:-}" in
+            "50 7 * * *") SLOT=morning ;;
+            "50 11 * * *") SLOT=afternoon ;;
+            "") SLOT="${INPUT_SLOT:-}" ;;
+            *) echo "Unknown watchdog schedule: ${TRIGGER_SCHEDULE}"; exit 1 ;;
+          esac
+
+          # Must match the cron entries in update_resume.yml.
+          case "${SLOT}" in
+            morning) SLOT_CRON="50 23 * * *" ;;
+            afternoon) SLOT_CRON="50 3 * * *" ;;
+            *) echo "Unknown watchdog slot: ${SLOT}"; exit 1 ;;
+          esac
+
+          # The latest time at or before now that matches the slot's daily cron.
+          read -r cron_minute cron_hour _ <<< "${SLOT_CRON}"
+          now="$(date -u +%s)"
+          slot_start=$(( now / 86400 * 86400 + (10#${cron_hour} * 60 + 10#${cron_minute}) * 60 ))
+          if [ "${slot_start}" -gt "${now}" ]; then
+            slot_start=$(( slot_start - 86400 ))
+          fi
+          slot_start_iso="$(jq -rn --argjson t "${slot_start}" '$t | todate')"
+          slot_label="$(jq -rn --argjson t "$(( slot_start + 9 * 3600 ))" '$t | strftime("%Y-%m-%d %H:%M KST")')"
+
+          runs="$(
+            timeout 30s gh api --paginate --slurp --method GET \
+              "repos/${GH_REPO}/actions/workflows/update_resume.yml/runs" \
+              -f "created=>=${slot_start_iso}" \
+              -f per_page=100
+          )"
+
+          # Scheduled runs carry their cron in the title, so a late start cannot move a run
+          # into another slot. The slot is healthy when any run in the chain started by its
+          # scheduled run succeeded; retries carry the scheduled run ID in their title.
+          state="$(jq -r --arg cron "${SLOT_CRON}" --argjson slot_start "${slot_start}" '
+            [.[].workflow_runs[]] as $runs
+            | [$runs[] | select(.event == "schedule")
+                | select(.display_title | endswith(", schedule \($cron))"))
+                | select((.created_at | fromdate) as $t | $t >= $slot_start and $t < $slot_start + 86400)] as $roots
+            | if ($roots | length) == 0 then "missing"
+              else
+                [$roots[].id as $id | $runs[]
+                  | select(.id == $id or (.display_title | endswith(", chain \($id))")))] as $chain
+                | if any($chain[]; .conclusion == "success") then "ok"
+                  elif any($chain[]; .status != "completed") then "pending"
+                  else "failed" end
+              end
+          ' <<< "${runs}")"
+
+          case "${state}" in
+            ok)
+              echo "The ${slot_label} slot updated the resume."
+              exit 0
+              ;;
+            missing)
+              reason="예정 실행이 시작되지 않았습니다. GitHub 스케줄 누락 여부를 확인하세요."
+              ;;
+            pending)
+              reason="실행이 아직 끝나지 않았습니다. 자체 runner가 오프라인인지 확인하세요."
+              ;;
+            failed)
+              reason="모든 시도가 성공 없이 끝났습니다."
+              ;;
+            *)
+              echo "Unexpected watchdog state: ${state}"
+              exit 1
+              ;;
+          esac
+
+          echo "::warning::The ${slot_label} slot did not update the resume (${state})."
+          MESSAGE="$(cat <<EOF
+          ⚠️ 이력서 업데이트 확인 필요
+          대상: ${slot_label} 예정 실행
+          상태: ${reason}
+          확인: ${RUNS_URL}
+          EOF
+          )"
+          curl --silent --show-error --fail \
+            --connect-timeout 5 \
+            --max-time 15 \
+            --output /dev/null \
+            --request POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${MESSAGE}"
+
+  # This action refreshes only this workflow, so every scheduled example needs it.
+  workflow-keepalive:
+    if: github.event_name == 'schedule' && vars.ENABLE_AUTOMATION == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - uses: liskin/gh-workflow-keepalive@f72ff1a1336129f29bf0166c0fd0ca6cf1bcb38c # v1
+        continue-on-error: true

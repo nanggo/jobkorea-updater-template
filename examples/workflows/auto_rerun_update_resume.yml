@@ -1,0 +1,186 @@
+# Installation: see examples/workflows/README.md before copying into .github/workflows/.
+name: Auto Rerun Update Resume
+
+on:
+  workflow_run:
+    workflows: ["Update Resume"]
+    types: [completed]
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: auto-rerun-update-resume-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  recover-dispatch-failure:
+    if: >
+      vars.ENABLE_AUTOMATION == 'true' &&
+      (github.event.workflow_run.event == 'schedule' ||
+      github.event.workflow_run.event == 'workflow_dispatch') &&
+      github.event.workflow_run.conclusion == 'failure'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check retry dispatch failure
+        id: dispatch_failure
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+
+          run_metadata="$(timeout 30s gh run view "${RUN_ID}" --repo "${GH_REPO}" --json jobs,displayTitle)"
+
+          retry_job_name="$(jq -r '
+            [.jobs[] as $job
+              | $job.steps[]?
+              | select(
+                  (.name == "Notify JobKorea probe failure" or
+                   .name == "Dispatch retry after update failure") and
+                  .conclusion == "failure"
+                )
+              | $job.name
+            ] | .[0] // empty
+          ' <<< "${run_metadata}")"
+
+          case "${retry_job_name}" in
+            probe-failure-[1-4]|retry-update-resume-[1-4])
+              source_attempt="${retry_job_name##*-}"
+              ;;
+            *)
+              echo "should_dispatch=false" >> "${GITHUB_OUTPUT}"
+              exit 0
+              ;;
+          esac
+
+          if [ "${source_attempt}" -lt 4 ]; then
+            chain_id="$(jq -r '.displayTitle | capture("^Update Resume \\(attempt [1-4], chain (?<id>[0-9]+)(, schedule [0-9* ]+)?\\)$").id' <<< "${run_metadata}")"
+            if [[ ! "${chain_id}" =~ ^[0-9]+$ ]]; then
+              echo "Unable to identify the original retry chain; refusing dispatch."
+              exit 1
+            fi
+            echo "chain_id=${chain_id}" >> "${GITHUB_OUTPUT}"
+            echo "should_dispatch=true" >> "${GITHUB_OUTPUT}"
+            echo "source_attempt=${source_attempt}" >> "${GITHUB_OUTPUT}"
+          else
+            echo "should_dispatch=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Dispatch missed retry
+        id: dispatch_missed_retry
+        if: steps.dispatch_failure.outputs.should_dispatch == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RETRY_REF: ${{ github.event.workflow_run.head_branch }}
+          SOURCE_ATTEMPT: ${{ steps.dispatch_failure.outputs.source_attempt }}
+          CHAIN_ID: ${{ steps.dispatch_failure.outputs.chain_id }}
+        run: |
+          set -euo pipefail
+
+          NEXT_ATTEMPT=$((SOURCE_ATTEMPT + 1))
+          RETRY_REF="${RETRY_REF:-main}"
+          echo "Waiting 180s before recovering retry attempt ${NEXT_ATTEMPT}/4."
+          sleep 180
+
+          dispatch_retry() {
+            local existing_retry dispatch_attempt dispatch_delay chain_created_at
+
+            if [[ ! "${CHAIN_ID}" =~ ^[0-9]+$ ]] || [[ ! "${NEXT_ATTEMPT}" =~ ^[2-4]$ ]]; then
+              echo "Invalid retry chain or attempt; refusing dispatch."
+              return 1
+            fi
+            if ! chain_created_at="$(timeout 30s gh run view "${CHAIN_ID}" --repo "${GH_REPO}" --json createdAt --jq .createdAt)"; then
+              echo "Unable to read the retry chain start; refusing dispatch."
+              return 1
+            fi
+            if [[ ! "${chain_created_at}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
+              echo "Invalid retry chain start; refusing dispatch."
+              return 1
+            fi
+
+            retry_already_exists() {
+              if ! existing_retry="$(
+                timeout 30s gh api --paginate --slurp --method GET \
+                  "repos/${GH_REPO}/actions/workflows/update_resume.yml/runs" \
+                  -f "branch=${RETRY_REF}" \
+                  -f event=workflow_dispatch \
+                  -f "created=>=${chain_created_at}" \
+                  -f per_page=100 \
+                  | jq --arg title "Update Resume (attempt ${NEXT_ATTEMPT}, chain ${CHAIN_ID})" \
+                    'any(.[].workflow_runs[]; .display_title == $title)'
+              )"; then
+                echo "Unable to verify whether retry attempt ${NEXT_ATTEMPT} already exists. Refusing a duplicate dispatch."
+                return 2
+              fi
+              [ "${existing_retry}" = "true" ]
+            }
+
+            if retry_already_exists; then
+              echo "Retry attempt ${NEXT_ATTEMPT} already exists (including completed runs)."
+              return 0
+            elif [ "$?" -eq 2 ]; then
+              return 1
+            fi
+
+            for dispatch_attempt in 1 2 3; do
+              if timeout 30s gh workflow run update_resume.yml \
+                --repo "${GH_REPO}" \
+                --ref "${RETRY_REF}" \
+                -f "attempt=${NEXT_ATTEMPT}" \
+                -f "chain_id=${CHAIN_ID}"; then
+                return 0
+              fi
+
+              dispatch_delay=$((dispatch_attempt * 5))
+              echo "Retry dispatch returned an error (${dispatch_attempt}/3). Checking for an accepted run in ${dispatch_delay}s."
+              sleep "${dispatch_delay}"
+
+              if retry_already_exists; then
+                echo "Retry attempt ${NEXT_ATTEMPT} was accepted despite the dispatch error."
+                return 0
+              elif [ "$?" -eq 2 ]; then
+                return 1
+              fi
+            done
+            return 1
+          }
+
+          dispatch_retry
+
+      - name: Notify exhausted dispatch fallback
+        if: >
+          failure() &&
+          steps.dispatch_missed_retry.outcome == 'failure'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          set -euo pipefail
+
+          MESSAGE="$(cat <<EOF
+          ❌ 이력서 업데이트 재시도 생성 실패
+          이유: 기본 요청과 보조 요청 모두 다음 workflow run을 생성하지 못했습니다.
+          조치: GitHub Actions에서 수동 재실행이 필요합니다.
+          확인: ${RUN_URL}
+          시간: $(TZ=Asia/Seoul date '+%Y-%m-%d %H:%M:%S KST')
+          EOF
+          )"
+
+          curl --silent --show-error --fail \
+            --connect-timeout 5 \
+            --max-time 15 \
+            --output /dev/null \
+            --request POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${MESSAGE}" || echo "Telegram fallback exhaustion notification failed"
+
+      - name: Skip non-dispatch failure
+        if: steps.dispatch_failure.outputs.should_dispatch != 'true'
+        run: echo "Failure was not caused by a recoverable retry dispatch error; skipping fallback dispatch."
