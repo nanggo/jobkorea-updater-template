@@ -149,4 +149,19 @@ examples/workflows/     private 운영 저장소에 설치할 예제
 
 이 저장소는 소스를 재사용하기 위한 출발점입니다. 템플릿으로 생성한 저장소에 이후 수정이 자동 반영되지는 않습니다. 공통 수정은 공개 저장소에서 확인하고 필요한 변경을 검토·테스트한 후 운영 저장소에 반영하세요. 공개 저장소의 최신 코드를 운영 runner가 무조건 내려받아 실행하게 구성하지 않습니다.
 
+### 이후 변경 가져오기
+
+템플릿으로 만든 저장소는 이 저장소와 Git 히스토리를 공유하지 않아 `git merge`나 `git pull`로 가져올 수 없습니다. 템플릿을 remote로 추가하고 필요한 커밋을 골라 적용하세요.
+
+```sh
+git remote add template https://github.com/nanggo/jobkorea-updater-template.git
+git fetch template
+git log --oneline template/main   # 가져올 커밋 확인
+git cherry-pick <commit>
+```
+
+여러 커밋을 가져올 때는 오래된 것부터 순서대로 적용합니다. 적용한 뒤 `pnpm install --frozen-lockfile`, `pnpm lint`, `pnpm test`로 확인하세요.
+
+**cherry-pick은 `examples/workflows/`만 바꿉니다.** `.github/workflows/`에 설치한 복사본은 그대로 남습니다. 예제가 바뀐 커밋이라면 `git show <commit> -- examples/workflows/`로 변경분을 확인해 설치본에 같은 내용을 반영하고, 새로 추가된 예제는 복사하세요. `pnpm test`는 예제만 검사하므로 이 누락을 알려주지 않습니다.
+
 라이선스: [ISC](LICENSE).
