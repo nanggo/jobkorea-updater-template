@@ -4,10 +4,23 @@ const assert = require("node:assert/strict");
 const {
   isJobKoreaAccountRecoveryPath,
   isJobKoreaLoginPath,
+  isJobKoreaTwoFactorPath,
+  isJobKoreaMypagePath,
   isTrustedJobKoreaUrl,
   isTrustedJobKoreaWebSocketUrl,
   requireTrustedJobKoreaUrl,
 } = require("../dist/utils/jobkoreaUrl");
+
+test("recognizes 2FA and mypage paths without matching similar names or query strings", () => {
+  for (const pathname of ["/user/TwoFactorAuth/Index", "/User/TwoFactorAuth", "/user/twofactorauth/"]) {
+    assert.equal(isJobKoreaTwoFactorPath(`https://www.jobkorea.co.kr${pathname}`), true);
+  }
+  for (const pathname of ["/user/TwoFactorAuthentication", "/?next=/user/TwoFactorAuth/Index", "/Login/"]) {
+    assert.equal(isJobKoreaTwoFactorPath(`https://www.jobkorea.co.kr${pathname}`), false);
+  }
+  assert.equal(isJobKoreaMypagePath("https://www.jobkorea.co.kr/User/Mypage/"), true);
+  assert.equal(isJobKoreaMypagePath("https://www.jobkorea.co.kr/User/MypageFake"), false);
+});
 
 test("allows only HTTPS JobKorea hosts on the default port", () => {
   assert.equal(isTrustedJobKoreaUrl("https://jobkorea.co.kr/Login/"), true);

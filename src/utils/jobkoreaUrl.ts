@@ -60,3 +60,25 @@ export function isJobKoreaAccountRecoveryPath(value: string | URL): boolean {
     return false;
   }
 }
+
+export function isJobKoreaTwoFactorPath(value: string | URL): boolean {
+  try {
+    const url = value instanceof URL ? value : new URL(value);
+    return /^\/user\/twofactorauth(?:\/|$)/i.test(url.pathname);
+  } catch {
+    return false;
+  }
+}
+
+export function isJobKoreaMypagePath(
+  value: string | URL,
+  expectedUrl = "https://www.jobkorea.co.kr/User/Mypage"
+): boolean {
+  try {
+    const url = value instanceof URL ? value : new URL(value);
+    const normalize = (pathname: string) => pathname.replace(/\/$/, "").toLowerCase();
+    return normalize(url.pathname) === normalize(new URL(expectedUrl).pathname);
+  } catch {
+    return false;
+  }
+}

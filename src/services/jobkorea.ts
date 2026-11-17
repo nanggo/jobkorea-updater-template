@@ -1,6 +1,6 @@
 import { chmod, mkdir, writeFile } from "fs/promises";
 import * as path from "path";
-import { Dialog, Locator, Page } from "playwright";
+import { Dialog, Frame, Locator, Page } from "playwright";
 import { configManager } from "../config";
 import { Logger } from "../utils/logger";
 import { withRetry } from "../utils/retry";
@@ -8,11 +8,15 @@ import {
   AuthenticationError,
   isRetryableJobKoreaError,
   NavigationError,
+  SessionExpiredError,
+  TwoFactorAuthenticationError,
   UpdateError,
 } from "../types";
 import {
   isJobKoreaAccountRecoveryPath,
   isJobKoreaLoginPath,
+  isJobKoreaMypagePath,
+  isJobKoreaTwoFactorPath,
   isTrustedJobKoreaUrl,
 } from "../utils/jobkoreaUrl";
 import {
@@ -35,6 +39,15 @@ function describeLoginDialogs(messages: string[]): string {
     .filter(Boolean)
     .join(" / ");
   return text ? ` (JobKorea 안내: ${text.slice(0, 300)})` : "";
+}
+
+export function twoFactorDeadline(timer: string, requestedAt: number, now: number): number {
+  const match = /^(\d{1,2}):(\d{2})$/.exec(timer.trim());
+  const seconds = match ? Number(match[1]) * 60 + Number(match[2]) : 0;
+  if (!match || Number(match[2]) > 59 || seconds <= 0 || seconds > 180 || !Number.isFinite(requestedAt) || !Number.isFinite(now) || now < requestedAt) {
+    throw new AuthenticationError("사이트의 인증번호 유효시간을 확인하지 못했습니다.");
+  }
+  return Math.min(requestedAt + 180000, now + seconds * 1000);
 }
 
 export class JobKoreaService {
@@ -73,6 +86,12 @@ export class JobKoreaService {
       consumeBlockedContextNavigation(page.context());
     if (blockedUrl) {
       this.assertTrustedUrl(blockedUrl, operation);
+    }
+  }
+
+  private assertNoTwoFactorChallenge(page: Page = this.page): void {
+    if (isJobKoreaTwoFactorPath(page.url())) {
+      throw new TwoFactorAuthenticationError();
     }
   }
 
@@ -440,6 +459,7 @@ export class JobKoreaService {
         );
 
         this.assertTrustedUrl(this.page.url(), "navigation");
+        this.assertNoTwoFactorChallenge();
         if (response && !response.ok()) {
           throw new NavigationError(
             `로그인 페이지가 HTTP ${response.status()}로 응답했습니다.`,
@@ -481,6 +501,7 @@ export class JobKoreaService {
         shouldRetry: isRetryableJobKoreaError,
       }
     ).catch(async (originalError: Error) => {
+      this.assertNoTwoFactorChallenge();
       if (this.shouldSkipNavigationArtifacts(originalError)) {
         Logger.warning(
           "로그인 페이지 응답 미수신 상태라 스크린샷/HTML 저장을 생략합니다.",
@@ -511,6 +532,16 @@ export class JobKoreaService {
 
   async login(id: string, password: string): Promise<Page | null> {
     let submissionAttempted = false;
+    let reachedTwoFactor = false;
+    const recordAuthRedirect = (frame: Frame) => {
+      if (frame === this.page.mainFrame() && isTrustedJobKoreaUrl(frame.url()) && isJobKoreaTwoFactorPath(frame.url())) {
+        reachedTwoFactor = true;
+      }
+    };
+    const assertNoChallenge = () => {
+      if (reachedTwoFactor) throw new TwoFactorAuthenticationError();
+      this.assertNoTwoFactorChallenge();
+    };
     // JobKorea explains a refused login in an alert before redirecting, and
     // Playwright dismisses unhandled dialogs silently, so record them while submitting.
     const loginDialogMessages: string[] = [];
@@ -570,6 +601,7 @@ export class JobKoreaService {
       );
 
       this.page.on("dialog", recordLoginDialog);
+      this.page.on("framenavigated", recordAuthRedirect);
       submissionAttempted = true;
       await Promise.all([
         navigationPromise,
@@ -578,6 +610,7 @@ export class JobKoreaService {
 
       this.assertNoBlockedNavigation(this.page, "authentication");
       this.assertTrustedUrl(this.page.url(), "authentication");
+      assertNoChallenge();
       if (isJobKoreaAccountRecoveryPath(this.page.url())) {
         throw new AuthenticationError(
           "JobKorea가 로그인을 완료하지 않고 계정 찾기 페이지로 이동시켰습니다. " +
@@ -589,14 +622,24 @@ export class JobKoreaService {
       const popup = await popupPromise;
       this.assertNoBlockedNavigation(this.page, "authentication");
       this.assertTrustedUrl(this.page.url(), "authentication");
+      assertNoChallenge();
+      if (isJobKoreaLoginPath(this.page.url())) {
+        throw new AuthenticationError("로그인이 완료되지 않고 로그인 페이지로 돌아왔습니다." + describeLoginDialogs(loginDialogMessages));
+      }
       if (popup) {
         this.assertNoBlockedNavigation(popup, "authentication");
+        this.assertNoTwoFactorChallenge(popup);
       }
       disarmCredentialEgressGuard(this.page.context());
       Logger.success("로그인 성공 및 페이지 전환 확인 완료");
       return popup;
     } catch (error) {
-      await this.captureFailureArtifacts("login", this.page);
+      // 인증번호 화면은 진단 수집을 켰더라도 저장하지 않는다.
+      this.assertNoBlockedNavigation(this.page, "authentication");
+      assertNoChallenge();
+      if (!(error instanceof TwoFactorAuthenticationError)) {
+        await this.captureFailureArtifacts("login", this.page);
+      }
       this.assertNoBlockedNavigation(this.page, "authentication");
       if (error instanceof AuthenticationError) {
         throw error;
@@ -614,6 +657,7 @@ export class JobKoreaService {
         : new NavigationError(`로그인 폼 준비 실패: ${message}`);
     } finally {
       this.page.off("dialog", recordLoginDialog);
+      this.page.off("framenavigated", recordAuthRedirect);
     }
   }
 
@@ -632,6 +676,7 @@ export class JobKoreaService {
         .catch(() => undefined);
       this.assertNoBlockedNavigation(popup, "authentication");
       this.assertTrustedUrl(popup.url(), "authentication");
+      this.assertNoTwoFactorChallenge(popup);
       Logger.info("로그인 팝업 처리 중...");
       await popup.waitForSelector('a[href*="나중에 변경"]', {
         timeout: this.timeouts.element,
@@ -682,14 +727,15 @@ export class JobKoreaService {
         this.assertNoBlockedNavigation(this.page, "navigation");
 
         this.assertTrustedUrl(this.page.url(), "navigation");
+        this.assertNoTwoFactorChallenge();
         if (response && !response.ok()) {
           throw new NavigationError(
             `마이페이지가 HTTP ${response.status()}로 응답했습니다.`,
             { currentUrl: this.page.url(), status: response.status() }
           );
         }
-        if (isJobKoreaLoginPath(this.page.url())) {
-          throw new AuthenticationError("마이페이지 접근 중 로그인 페이지로 되돌아갔습니다.");
+        if (!isJobKoreaMypagePath(this.page.url(), this.urls.mypage)) {
+          throw new SessionExpiredError();
         }
 
         await this.waitForAnySelector(this.selectors.mypage.statusLink, {
@@ -697,6 +743,11 @@ export class JobKoreaService {
           timeout: this.timeouts.element,
         });
         this.assertNoBlockedNavigation(this.page, "navigation");
+        this.assertTrustedUrl(this.page.url(), "authentication");
+        this.assertNoTwoFactorChallenge();
+        if (!isJobKoreaMypagePath(this.page.url(), this.urls.mypage)) {
+          throw new SessionExpiredError();
+        }
         Logger.success("마이페이지로 이동 완료");
       },
       {
@@ -705,11 +756,96 @@ export class JobKoreaService {
         shouldRetry: isRetryableJobKoreaError,
       }
     ).catch((error: Error) => {
+      this.assertNoTwoFactorChallenge();
       if (!isRetryableJobKoreaError(error)) {
         throw error;
       }
       throw new NavigationError(`마이페이지 이동 실패: ${error.message}`);
     });
+  }
+
+  async tryRestoreSession(): Promise<boolean> {
+    try {
+      await this.navigateToMypage();
+      return true;
+    } catch (error) {
+      if (error instanceof SessionExpiredError) return false;
+      throw error;
+    }
+  }
+
+  async waitForManualAuthentication(timeout = 600000): Promise<void> {
+    try {
+      const mypage = this.page.waitForURL(
+        url => isTrustedJobKoreaUrl(url.href) && isJobKoreaMypagePath(url, this.urls.mypage),
+        { timeout, waitUntil: "domcontentloaded" }
+      );
+      // JobKorea confirms a valid OTP in an HTML dialog before navigating.
+      // Handle only this observed success dialog; never resend or guess a code.
+      const acknowledgeSuccess = async () => {
+        const confirmation = this.page
+          .getByRole("dialog", { name: "2단계 인증 완료", exact: true })
+          .getByRole("button", { name: "확인", exact: true });
+        await confirmation.waitFor({ state: "visible", timeout });
+        this.assertNoBlockedNavigation(this.page, "authentication");
+        this.assertTrustedUrl(this.page.url(), "authentication");
+        await confirmation.click();
+        await mypage;
+      };
+      await Promise.race([mypage, acknowledgeSuccess()]);
+    } catch (error) {
+      if (error instanceof AuthenticationError) throw error;
+      throw new AuthenticationError("수동 인증을 완료하지 못했습니다. 인증 상태를 저장하지 않습니다.");
+    }
+    this.assertNoBlockedNavigation(this.page, "authentication");
+    await this.navigateToMypage();
+    disarmCredentialEgressGuard(this.page.context());
+  }
+
+  async requestSmsTwoFactor(): Promise<number> {
+    this.assertNoBlockedNavigation(this.page, "authentication");
+    this.assertTrustedUrl(this.page.url(), "authentication");
+    if (!isJobKoreaTwoFactorPath(this.page.url())) throw new AuthenticationError("2단계 인증 화면이 아닙니다.");
+    armCredentialEgressGuard(this.page.context());
+    const radio = this.page.getByRole("radio", { name: /^휴대폰 / });
+    if (await radio.count() !== 1) throw new AuthenticationError("휴대폰 인증 수단을 확인하지 못했습니다.");
+    const label = await radio.evaluate(element => (element as HTMLInputElement).labels?.[0]?.textContent?.replace(/\s+/g, " ").trim());
+    if (!label || !label.startsWith("휴대폰 ")) throw new AuthenticationError("휴대폰 인증 선택 항목을 확인하지 못했습니다.");
+    // The custom radio's decorative dot intercepts clicks on the input itself.
+    await this.page.getByText(label, { exact: true }).click();
+    if (!await radio.isChecked()) throw new AuthenticationError("휴대폰 인증 수단이 선택되지 않았습니다.");
+    this.assertNoBlockedNavigation(this.page, "authentication");
+    this.assertTrustedUrl(this.page.url(), "authentication");
+    const requestedAt = Date.now();
+    await this.page.getByRole("button", { name: "인증번호 발송", exact: true }).click();
+    await this.page.getByRole("textbox", { name: "인증번호", exact: true }).waitFor({ state: "visible" });
+    await this.page.getByRole("dialog", { name: "인증번호 발송 완료", exact: true })
+      .getByRole("button", { name: "확인", exact: true }).click();
+    const timer = await this.page.getByRole("timer", { name: "남은 시간", exact: true }).innerText();
+    return twoFactorDeadline(timer, requestedAt, Date.now());
+  }
+
+  async submitTwoFactorCode(code: string, deadline: number = Number.POSITIVE_INFINITY): Promise<void> {
+    if (!/^\d{6}$/.test(code)) throw new AuthenticationError("인증번호 형식이 올바르지 않습니다.");
+    Logger.registerSensitiveValues([code]);
+    try {
+      if (Date.now() >= deadline) throw new AuthenticationError("인증번호 입력 시간이 만료되었습니다.");
+      this.assertNoBlockedNavigation(this.page, "authentication");
+      this.assertTrustedUrl(this.page.url(), "authentication");
+      if (!isJobKoreaTwoFactorPath(this.page.url())) throw new AuthenticationError("2단계 인증 화면이 아닙니다.");
+      armCredentialEgressGuard(this.page.context());
+      await this.page.getByRole("textbox", { name: "인증번호", exact: true }).fill(code);
+      this.assertNoBlockedNavigation(this.page, "authentication");
+      this.assertTrustedUrl(this.page.url(), "authentication");
+      if (Date.now() >= deadline) throw new AuthenticationError("인증번호 입력 시간이 만료되었습니다.");
+      await Promise.all([
+        this.waitForManualAuthentication(20000),
+        this.page.getByRole("button", { name: "인증하기", exact: true }).click({ timeout: Math.max(1, Math.min(this.timeouts.element, deadline - Date.now())) }),
+      ]);
+    } catch {
+      // Locator errors can embed field contents; never propagate them.
+      throw new AuthenticationError("인증번호 확인을 완료하지 못했습니다. 코드를 다시 제출하지 않고 중단합니다.");
+    }
   }
 
   async updateCareerInfo(): Promise<void> {

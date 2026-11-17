@@ -5,6 +5,8 @@ process.env.POPUP_TIMEOUT_MS = "1000";
 
 const { BrowserService } = require("../dist/services/browser");
 const { verifyBrowserUpdateFlow } = require("./browser-update.smoke");
+const { verifyBrowserAuthFlow } = require("./browser-auth.smoke");
+const { verifyBrowserTelegramAuthFlow } = require("./browser-telegram-auth.smoke");
 
 async function main() {
   const browserService = new BrowserService();
@@ -14,6 +16,8 @@ async function main() {
   } finally {
     await browserService.close();
   }
+  await verifyBrowserAuthFlow();
+  await verifyBrowserTelegramAuthFlow();
 }
 
 main().catch(error => {

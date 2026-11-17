@@ -286,9 +286,13 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           NAVIGATION_TIMEOUT_MS: "30000"
+          TELEGRAM_AUTH_ENABLED: "true"
+          TELEGRAM_AUTH_BOT_TOKEN: ${{ secrets.TELEGRAM_AUTH_BOT_TOKEN || secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_AUTH_CHAT_ID: ${{ secrets.TELEGRAM_AUTH_CHAT_ID || secrets.TELEGRAM_CHAT_ID }}
           WORKFLOW_ATTEMPT: ${{ github.event.inputs.attempt || '1' }}
         run: |
           set +e
+          export JOBKOREA_AUTH_STATE_DIR="${HOME}/.local/state/jobkorea-updater"
           node dist/index.js
           exit_code=$?
           set -e

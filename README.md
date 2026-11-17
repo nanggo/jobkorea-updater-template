@@ -57,11 +57,78 @@ cp .env.example .env
 - 기본 일정: 매일 08:50, 12:50 KST. GitHub cron은 정시 실행을 보장하지 않습니다.
 - 연결 실패: workflow 단위로 최대 4회 시도하며 약 3분, 8분, 15분 후 재시도합니다.
 - 인증 실패: 계정 잠금을 피하려고 자동 재시도하지 않습니다.
+- 2단계 인증: 추가 인증이 필요하면 Telegram으로 인증번호를 받아 같은 실행에서 이어갑니다. 아래 [2단계 인증과 인증 상태 유지](#2단계-인증과-인증-상태-유지)를 참고하세요.
 - 중복 방지: 원래 실행 ID와 시도 번호를 기준으로 이미 생성된 재시도를 확인합니다.
 - Watchdog: 각 예약 슬롯의 8시간 뒤 성공 여부를 확인하고 누락·실패를 Telegram으로 알립니다.
 - Keepalive: 갱신과 watchdog 예제 각각에 포함합니다. 더미 커밋 없이 해당 workflow를 다시 활성화하는 보조 작업이며, API 오류는 갱신 결과를 실패로 바꾸지 않습니다. private 저장소에는 60일 무활동 제한이 적용되지 않지만 예제에는 포함되어 있습니다.
 
 Keepalive는 [해당 workflow 하나만 활성화](https://github.com/liskin/gh-workflow-keepalive)합니다. 이미 꺼진 예약 실행을 스스로 시작하거나 GitHub의 장애를 해결하는 기능은 아닙니다. 갱신과 watchdog 모두 GitHub 스케줄러에 의존하므로 외부 서비스 수준의 가용성 감시를 대신하지 않습니다.
+
+## 2단계 인증과 인증 상태 유지
+
+로그인 뒤 `/user/TwoFactorAuth/`로 이동하면 `TELEGRAM_AUTH_ENABLED=true`일 때 같은 브라우저에서 Telegram 재인증을 기다립니다. 비활성화했거나 재인증에 실패하면 인증 오류로 종료하며 프로세스·workflow 재시도를 하지 않습니다. 인증 화면은 진단 파일로 저장하지 않습니다.
+
+`JOBKOREA_AUTH_STATE_DIR`을 지정하면 저장된 쿠키·localStorage로 마이페이지 접근을 먼저 확인합니다. 로그인이 유효하면 자격증명을 다시 제출하지 않고, 만료되어 로그인 화면이나 홈으로 돌아온 경우에만 기존 로그인 절차를 한 번 진행합니다. 2단계 인증이 다시 필요하면 사람이 재인증해야 합니다. 실제 유지 기간은 잡코리아의 판단에 따르며 코드에서 고정하지 않습니다.
+
+상태 파일은 저장소 밖의 전용 디렉터리(권한 `700`)에 `state.json`(권한 `600`)으로 원자적으로 저장합니다. 잡코리아 쿠키·localStorage만 보관하고 계정 ID의 해시로 실행 계정을 구분합니다. 다른 계정, 잘못된 파일, 넓은 접근 권한은 오류로 중단합니다. 파일에는 로그인 권한을 제공하는 정보가 있으므로 Git, Actions artifact, 채팅에 올리지 않습니다. IndexedDB/sessionStorage 의존 인증은 저장 대상이 아닙니다.
+
+예제 workflow는 runner 사용자의 `$HOME/.local/state/jobkorea-updater`를 사용합니다. checkout 정리와 별개로 유지되며, 최초 인증도 **같은 서버의 같은 runner 사용자**로 실행합니다. 실행마다 홈이 초기화되는 runner에서는 상태가 남지 않습니다.
+
+| 변수 | 기본값 | 설명 |
+| --- | --- | --- |
+| `TELEGRAM_AUTH_ENABLED` | `false` | 추가 인증 시 Telegram으로 인증번호를 받습니다. 예제 갱신 workflow는 `true` |
+| `TELEGRAM_AUTH_BOT_TOKEN` | 알림 bot token | 별도 인증 봇 token (선택) |
+| `TELEGRAM_AUTH_CHAT_ID` | 알림 chat ID | 인증번호를 받을 본인 개인 대화의 숫자 ID (선택) |
+| `JOBKOREA_AUTH_STATE_DIR` | 미설정 | 저장소 밖 인증 상태 전용 절대 경로. 미설정 시 저장·복원을 하지 않습니다 |
+
+### 최초 인증
+
+기본 방법은 Telegram입니다. 운영 저장소에 설치한 **Authenticate JobKorea** workflow를 `method=telegram`으로 실행하거나, 자동 갱신 중 추가 인증이 필요한 경우 다음 순서로 진행합니다.
+
+1. 봇의 준비 요청에서 **인증번호 받기** 버튼을 누릅니다. 버튼은 최대 7분 동안 사용할 수 있으며 누르기 전에는 문자를 발송하지 않습니다.
+2. 봇이 잡코리아에서 등록된 휴대폰으로 문자를 한 번 발송합니다.
+3. **인증번호 입력** 버튼을 눌러 입력 안내를 열거나, 같은 대화의 입력창에 받은 6자리 코드를 보냅니다. 일반 메시지와 답장을 모두 받습니다. 잡코리아 화면의 남은 시간과 문자 발송 시각을 기준으로 최대 3분만 받습니다.
+4. 코드를 한 번 제출하고 완료 안내를 확인한 뒤 인증 상태를 저장합니다. 자동 갱신 중이었다면 같은 실행에서 이력서 갱신을 이어갑니다.
+
+인증번호는 **본인과 봇의 개인 대화**에서만 받습니다. 사용자 ID, 요청보다 새로운 message ID, 메시지 시간을 함께 검사하며 단체방·전달 메시지·다른 사람·이전 요청에 붙인 답장은 사용하지 않습니다. 알림을 단체방이나 채널로 받는다면 `TELEGRAM_AUTH_CHAT_ID`에 본인 개인 대화의 ID를 지정하세요. `취소`로 중단할 수 있고, 처리한 메시지와 요청 메시지는 삭제합니다. 삭제 실패는 경고하며, 코드·수신 payload를 파일이나 로그에 저장하지 않습니다. 늦게 확인했다면 인증 workflow를 다시 실행해야 합니다.
+
+버튼은 본인·개인 대화·해당 봇 메시지·요청별 임의 토큰·마감 시간을 함께 확인하고, 누른 버튼은 제거합니다. 남은 시간은 Telegram의 상대 시각 표시로 앱에서 갱신되며 정확한 KST 마감 시각도 함께 적습니다. 만료된 클릭과 코드는 거절합니다.
+
+기존 webhook은 제거하거나 바꾸지 않습니다. 같은 봇의 `getUpdates`를 다른 프로그램이 사용한다면 전용 인증 봇을 만들고 `TELEGRAM_AUTH_BOT_TOKEN`, `TELEGRAM_AUTH_CHAT_ID` secrets를 지정하세요. 인증 중에는 해당 봇의 업데이트 큐를 소비하므로 수신기를 중복 운영하면 안 됩니다.
+
+실제 인증번호나 잡코리아 로그인을 사용하지 않는 연결 테스트는 `method=telegram-test`입니다. **연결 테스트 시작** 버튼을 누른 뒤 **인증번호 입력**을 눌러 테스트용 번호 `123456`을 보내면 버튼·입력·삭제를 검증합니다. 실제 번호는 보내지 않습니다.
+
+```sh
+gh workflow run authenticate.yml --ref main -f method=telegram-test
+```
+
+인증 상태만 점검하려면 `method=check`를 선택합니다. 인증 workflow는 갱신 workflow와 같은 concurrency 그룹을 사용해 동시에 실행되지 않고, 이력서 변경·artifact 업로드·후속 workflow dispatch를 하지 않습니다. 자동 trigger는 없으며 `main`에서만 실행됩니다.
+
+### 브라우저에서 직접 인증하기
+
+GUI가 있는 환경에서는 환경변수를 설정하고 `pnpm auth:setup`을 실행합니다. ID·비밀번호는 검증된 로그인 폼에 한 번만 제출하고, 문자·이메일 인증은 열린 브라우저에서 직접 완료합니다. 이 명령은 이력서를 수정하거나 Telegram을 보내지 않습니다.
+
+화면이 없는 서버에서는 로컬 Chrome으로 서버의 브라우저를 조작합니다. 먼저 로컬 터미널에서 runner 서버로 SSH 터널을 유지합니다.
+
+```sh
+ssh -N -L 127.0.0.1:9222:127.0.0.1:9222 <runner-host>
+```
+
+그다음 인증 workflow를 `method=browser`로 실행하거나, 서버에서 **runner를 실행하는 사용자**의 셸로 checkout에 들어가 직접 실행합니다. Bash의 `read`를 사용하면 비밀번호가 셸 기록이나 명령 인수에 들어가지 않습니다.
+
+```bash
+export JOBKOREA_AUTH_STATE_DIR="$HOME/.local/state/jobkorea-updater"
+read -rp 'JobKorea ID: ' JOBKOREA_ID
+read -rsp 'JobKorea password: ' JOBKOREA_PWD
+printf '\n'
+export JOBKOREA_ID JOBKOREA_PWD
+pnpm auth:setup --headless --debug-port=9222
+unset JOBKOREA_PWD
+```
+
+로컬 Chrome의 `chrome://inspect/#devices` → Configure에 `localhost:9222`를 추가하고, 잡코리아 인증 페이지의 **inspect**를 엽니다. DevTools의 화면 미러링(screencast)에서 인증 수단을 선택하고 받은 번호를 **잡코리아 페이지에 직접** 입력합니다. 최초 인증은 최대 10분 기다리며, 사이트의 인증번호 유효시간은 별도로 적용됩니다. debugger는 loopback에만 열고 인증 명령 종료 시 닫히므로 방화벽에 이 포트를 공개하지 않습니다.
+
+인증 명령은 마이페이지 접근을 확인한 뒤 상태를 저장하고, 브라우저를 완전히 종료한 다음 **새 Chromium 프로세스로 재사용을 검증**합니다. 재사용 검증이 실패하면 인증을 성공으로 간주하지 않습니다. 이후에도 `pnpm auth:check`로 이력서 변경 없이 재확인할 수 있습니다. 메일함이나 SMS 수신함을 읽지 않으며, 본인이 현재 요청에 전달한 코드만 사용합니다.
 
 ## 진단과 정보 보호
 
