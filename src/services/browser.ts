@@ -1,6 +1,7 @@
 import { Browser, chromium, Page, BrowserContext } from "playwright";
 import { Logger } from "../utils/logger";
 import { configManager } from "../config";
+import { AuthStateStore } from "./authState";
 import {
   isTrustedJobKoreaUrl,
   isTrustedJobKoreaWebSocketUrl,
@@ -70,6 +71,24 @@ export class BrowserService {
   private context: BrowserContext | null = null;
   private page: Page | null = null;
   private closingPromise: Promise<void> | null = null;
+  private restoredAuthState = false;
+  private readonly authStateStore?: AuthStateStore;
+
+  constructor(private readonly options: {
+    authStateDirectory?: string;
+    accountId?: string;
+    restoreAuthState?: boolean;
+    headless?: boolean;
+    // Only the interactive authentication helper enables a loopback debugger.
+    debugPort?: number;
+  } = {}) {
+    if (options.authStateDirectory) {
+      this.authStateStore = new AuthStateStore(options.authStateDirectory, options.accountId ?? "");
+    }
+    if (options.debugPort !== undefined && (!Number.isInteger(options.debugPort) || options.debugPort < 1024 || options.debugPort > 65535)) {
+      throw new Error("인증용 debugger 포트는 1024~65535 정수여야 합니다.");
+    }
+  }
 
   private wirePageDiagnostics(page: Page): void {
     page.on("domcontentloaded", () => {
@@ -120,17 +139,34 @@ export class BrowserService {
   async initialize(): Promise<void> {
     try {
       const browserConfig = configManager.getBrowserConfig();
+      const storageState = this.options.restoreAuthState === false
+        ? undefined
+        : await this.authStateStore?.load();
+      this.restoredAuthState = storageState !== undefined;
+      if (storageState) {
+        Logger.registerSensitiveValues([
+          ...storageState.cookies.map(cookie => cookie.value),
+          ...storageState.origins.flatMap(origin => origin.localStorage.map(item => item.value)),
+        ]);
+      }
 
       // 설정 기반 브라우저 옵션
       this.browser = await chromium.launch({
-        headless: browserConfig.headless,
+        headless: this.options.headless ?? browserConfig.headless,
         chromiumSandbox: true,
-        args: [...browserConfig.args],
+        args: [
+          ...browserConfig.args,
+          ...(this.options.debugPort === undefined ? [] : [
+            "--remote-debugging-address=127.0.0.1",
+            `--remote-debugging-port=${this.options.debugPort}`,
+          ]),
+        ],
         env: createBrowserEnvironment(process.env),
       });
 
       // 설정 기반 컨텍스트 설정
       this.context = await this.browser.newContext({
+        storageState,
         viewport: {
           width: browserConfig.viewport.width,
           height: browserConfig.viewport.height,
@@ -280,6 +316,17 @@ export class BrowserService {
       throw new Error("브라우저가 초기화되지 않았습니다.");
     }
     return this.page;
+  }
+
+  hasStoredAuthState(): boolean {
+    return this.restoredAuthState;
+  }
+
+  async saveAuthenticatedState(): Promise<void> {
+    if (!this.authStateStore) return;
+    if (!this.context) throw new Error("브라우저가 초기화되지 않았습니다.");
+    await this.authStateStore.save(await this.context.storageState());
+    Logger.info("인증 상태 저장 완료 (봇 계정 전용 파일)");
   }
 
   async close(): Promise<void> {

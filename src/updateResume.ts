@@ -4,6 +4,7 @@ import {
   isRetryableJobKoreaError,
   JobKoreaError,
   NavigationError,
+  TwoFactorAuthenticationError,
 } from "./types";
 import { Logger } from "./utils/logger";
 import { BrowserService } from "./services/browser";
@@ -11,9 +12,13 @@ import { JobKoreaService } from "./services/jobkorea";
 import { sendTelegramMessage } from "./notify";
 import { withBrowserRestart } from "./utils/retry";
 import { configManager } from "./config";
+import { authenticateViaTelegram } from "./services/twoFactorTelegram";
 
 export async function updateResume(config: Config): Promise<void> {
-  const browserService = new BrowserService();
+  const browserService = new BrowserService({
+    authStateDirectory: process.env.JOBKOREA_AUTH_STATE_DIR,
+    accountId: config.jobkoreaId,
+  });
   const retryConfig = configManager.getRetryConfig();
   let retryCount = 0;
 
@@ -42,20 +47,24 @@ export async function updateResume(config: Config): Promise<void> {
         const page = browserService.getPage();
         const jobKoreaService = new JobKoreaService(page);
 
-        // 1. 로그인 페이지로 이동
-        await jobKoreaService.navigateToLoginPage();
-
-        // 2. 로그인 수행
-        const loginPopup = await jobKoreaService.login(
-          config.jobkoreaId,
-          config.jobkoreaPwd
-        );
-
-        // 3. 로그인 후 팝업 처리
-        await jobKoreaService.handleLoginPopup(loginPopup);
-
-        // 4. 마이페이지로 이동
-        await jobKoreaService.navigateToMypage();
+        try {
+          const restored = browserService.hasStoredAuthState() &&
+            await jobKoreaService.tryRestoreSession();
+          if (!restored) {
+            await jobKoreaService.navigateToLoginPage();
+            const loginPopup = await jobKoreaService.login(config.jobkoreaId, config.jobkoreaPwd);
+            await jobKoreaService.handleLoginPopup(loginPopup);
+            await jobKoreaService.navigateToMypage();
+          }
+        } catch (error) {
+          if (!(error instanceof TwoFactorAuthenticationError) || process.env.TELEGRAM_AUTH_ENABLED !== "true") throw error;
+          await authenticateViaTelegram(jobKoreaService, {
+            token: process.env.TELEGRAM_AUTH_BOT_TOKEN || config.telegramToken,
+            chatId: process.env.TELEGRAM_AUTH_CHAT_ID || config.telegramChatId,
+          });
+        }
+        // Save only after verifying the authenticated page, before any resume mutation.
+        await browserService.saveAuthenticatedState();
 
         // 5. 경력 정보 업데이트
         await jobKoreaService.updateCareerInfo();

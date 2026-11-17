@@ -10,7 +10,9 @@
     "start": "node dist/index.js",
     "lint": "tsc --noEmit",
     "test": "pnpm build && node --test test/*.test.js",
-    "test:browser": "pnpm build && node test/browser-launch.smoke.js"
+    "test:browser": "pnpm build && node test/browser-launch.smoke.js",
+    "auth:setup": "pnpm build && node dist/authenticate.js",
+    "auth:check": "pnpm build && node dist/authenticate.js --check"
   },
   "keywords": [],
   "author": "",

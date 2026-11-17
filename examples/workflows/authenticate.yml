@@ -1,0 +1,72 @@
+name: Authenticate JobKorea
+
+on:
+  workflow_dispatch:
+    inputs:
+      method:
+        description: "Authentication method (telegram-test checks replies without logging into JobKorea)"
+        type: choice
+        default: telegram
+        options:
+          - telegram
+          - browser
+          - check
+          - telegram-test
+
+# The interactive browser and the scheduled updater share one account/state file.
+concurrency:
+  group: update-resume
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Run on the same runner and runner user as the update job; the saved state lives in that user's home.
+  authenticate:
+    if: vars.ENABLE_AUTOMATION == 'true' && github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, jobkorea]
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10.30.3
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Playwright Chromium
+        run: pnpm exec playwright install chromium
+
+      - name: Build project
+        run: pnpm build
+
+      - name: Complete interactive authentication
+        env:
+          JOBKOREA_ID: ${{ secrets.JOBKOREA_ID }}
+          JOBKOREA_PWD: ${{ secrets.JOBKOREA_PWD }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_AUTH_BOT_TOKEN || secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_AUTH_CHAT_ID || secrets.TELEGRAM_CHAT_ID }}
+          AUTH_METHOD: ${{ inputs.method || 'telegram' }}
+          NAVIGATION_TIMEOUT_MS: "30000"
+        run: |
+          export JOBKOREA_AUTH_STATE_DIR="${HOME}/.local/state/jobkorea-updater"
+          case "${AUTH_METHOD}" in
+            telegram) node dist/authenticate.js --telegram ;;
+            browser) node dist/authenticate.js --headless --debug-port=9222 ;;
+            check) node dist/authenticate.js --check ;;
+            telegram-test) node dist/authenticate.js --telegram-test ;;
+            *) echo "Unsupported authentication method"; exit 1 ;;
+          esac

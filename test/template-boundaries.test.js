@@ -10,7 +10,7 @@ const examples = "examples/workflows/";
 test("CI runs without account access or a self-hosted runner", () => {
   const active = fs.readdirSync(path.join(root, ".github/workflows"))
     .filter(name => /\.ya?ml$/.test(name));
-  const runtimeNames = ["update_resume.yml", "update_resume_watchdog.yml", "auto_rerun_update_resume.yml"];
+  const runtimeNames = ["update_resume.yml", "update_resume_watchdog.yml", "auto_rerun_update_resume.yml", "authenticate.yml"];
   // Operational copies can install these examples; check the template's CI boundary separately.
   assert.ok(active.includes("ci.yml"));
   for (const name of active.filter(name => !runtimeNames.includes(name))) {
@@ -28,6 +28,8 @@ test("runtime examples require explicit activation before accessing the account"
     assert.ok(read(examples + file).includes(`  ${job}:\n    if: vars.ENABLE_AUTOMATION == 'true'\n`));
   }
   assert.match(read(examples + "auto_rerun_update_resume.yml"), /if: >\n      vars\.ENABLE_AUTOMATION == 'true' &&/);
+  assert.ok(read(examples + "authenticate.yml")
+    .includes("  authenticate:\n    if: vars.ENABLE_AUTOMATION == 'true' && github.ref == 'refs/heads/main'\n"));
 });
 
 test("each scheduled example has an independent, least-privilege keepalive", () => {

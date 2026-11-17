@@ -126,15 +126,16 @@ function createLoginForm({
 function createPage(form, overrides = {}) {
   const browserContext = {};
   const dialogListeners = new Set();
+  let url = "https://www.jobkorea.co.kr/Login/Login_Tot.asp";
   return {
     context: () => browserContext,
-    url: () => "https://www.jobkorea.co.kr/Login/Login_Tot.asp",
+    url: () => url,
     locator: selector =>
       selector === "form:visible"
         ? locatorCollection([form])
         : locatorCollection([]),
     waitForEvent: async () => null,
-    waitForURL: async () => undefined,
+    waitForURL: async () => { url = "https://www.jobkorea.co.kr/User/Mypage"; },
     waitForTimeout: async () => undefined,
     on(event, listener) {
       if (event === "dialog") dialogListeners.add(listener);
@@ -466,4 +467,65 @@ test("adds a login alert to the failure when the login page stays", async () => 
         "로그인 실패: Timeout 20ms exceeded. (JobKorea 안내: 아이디 또는 비밀번호를 다시 확인해주세요.)"
   );
   assert.equal(page.dialogListenerCount(), 0);
+});
+
+test("stops immediately at 2FA without logging success or capturing the challenge", async () => {
+  const { TwoFactorAuthenticationError, getFailureExitCode } = require("../dist/types");
+  let currentUrl = "https://www.jobkorea.co.kr/Login/Login_Tot.asp";
+  let submits = 0;
+  const form = createLoginForm({ onClick: () => {
+    submits++;
+    currentUrl = "https://www.jobkorea.co.kr/user/TwoFactorAuth/Index";
+  } });
+  const page = createPage(form, {
+    url: () => currentUrl,
+    waitForURL: async predicate => {
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(predicate(new URL(currentUrl)), true);
+    },
+  });
+  const service = new JobKoreaService(page);
+  service.captureFailureArtifacts = async () => assert.fail("Never persist a 2FA screen");
+  await assert.rejects(service.login("synthetic-user", "synthetic-password"), error => {
+    assert.ok(error instanceof TwoFactorAuthenticationError);
+    assert.equal(error.retryable, false);
+    assert.equal(getFailureExitCode(error), 1, "Must not dispatch a workflow retry");
+    return true;
+  });
+  assert.equal(submits, 1);
+  assert.equal(isCredentialEgressGuardArmed(page.context()), true);
+});
+
+test("recognizes a late 2FA redirect while waiting for the popup", async () => {
+  const { TwoFactorAuthenticationError } = require("../dist/types");
+  let url = "https://www.jobkorea.co.kr/Login/Login_Tot.asp";
+  const form = createLoginForm({ onClick: () => { url = "https://www.jobkorea.co.kr/"; } });
+  const page = createPage(form, {
+    url: () => url,
+    waitForEvent: async () => {
+      await new Promise(resolve => setTimeout(resolve, 5));
+      url = "https://www.jobkorea.co.kr/user/TwoFactorAuth/Index";
+      return null;
+    },
+  });
+  await assert.rejects(new JobKoreaService(page).login("user-id", "password"), TwoFactorAuthenticationError);
+});
+
+test("remembers a 2FA redirect even when the site immediately redirects again", async () => {
+  const { TwoFactorAuthenticationError } = require("../dist/types");
+  let currentUrl = "https://www.jobkorea.co.kr/Login/Login_Tot.asp";
+  let navigationListener;
+  const frame = { url: () => currentUrl };
+  const form = createLoginForm({ onClick: () => {
+    currentUrl = "https://www.jobkorea.co.kr/user/TwoFactorAuth/Index";
+    navigationListener(frame);
+    currentUrl = "https://www.jobkorea.co.kr/Login/Login_Tot.asp";
+  } });
+  const page = createPage(form, {
+    url: () => currentUrl,
+    mainFrame: () => frame,
+    on: (event, listener) => { if (event === "framenavigated") navigationListener = listener; },
+    off: () => {},
+  });
+  await assert.rejects(new JobKoreaService(page).login("user-id", "password"), TwoFactorAuthenticationError);
 });

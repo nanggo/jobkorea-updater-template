@@ -61,6 +61,23 @@ export class AuthenticationError extends JobKoreaError {
   }
 }
 
+export class TwoFactorAuthenticationError extends AuthenticationError {
+  constructor() {
+    super(
+      "JobKorea 2단계 인증이 필요합니다. 자동 재시도를 중단합니다. " +
+      "봇 실행 환경에서 README의 최초 인증 절차로 직접 인증한 뒤 인증 상태를 저장하세요."
+    );
+    this.name = "TwoFactorAuthenticationError";
+  }
+}
+
+export class SessionExpiredError extends AuthenticationError {
+  constructor() {
+    super("마이페이지에 접근할 수 없습니다. 저장된 로그인이 없거나 만료되었습니다.");
+    this.name = "SessionExpiredError";
+  }
+}
+
 export class NavigationError extends JobKoreaError {
   constructor(
     message: string,
